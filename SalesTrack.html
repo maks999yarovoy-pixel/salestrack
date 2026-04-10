@@ -1,0 +1,1008 @@
+<html lang="uk"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SalesTrack</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=DM+Sans:wght@300;400;500;600&display=swap');
+:root{--bg:#0b0d12;--s:#13161f;--s2:#1a1e2b;--bd:#252b3b;--ac:#4f8eff;--gr:#00e5a0;--rd:#ff4f6e;--gd:#ffd166;--tx:#e4e7f2;--mu:#606880;--cu:#60a5fa;--ce:#c084fc;--ch:#34d399;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;font-size:14px;}
+
+header{background:var(--s);border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:8px;padding:0 16px;height:52px;position:sticky;top:0;z-index:100;flex-wrap:wrap;}
+.logo{font-family:'Unbounded',sans-serif;font-size:12px;font-weight:800;color:var(--ac);letter-spacing:.08em;white-space:nowrap;}
+.logo span{color:var(--gr);}
+nav{display:flex;gap:3px;margin-left:auto;align-items:center;}
+.tb{background:none;border:none;color:var(--mu);padding:6px 12px;border-radius:7px;cursor:pointer;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:500;transition:all .18s;white-space:nowrap;}
+.tb.active{background:var(--ac);color:#fff;}
+.tb:hover:not(.active){background:var(--s2);color:var(--tx);}
+.btn-save{background:var(--gr);color:#0b0d12;border:none;padding:7px 14px;border-radius:7px;cursor:pointer;font-family:'DM Sans',sans-serif;font-size:13px;font-weight:700;white-space:nowrap;transition:all .2s;}
+.btn-save:hover{background:#00c98a;}
+
+.rates{background:var(--s);border-bottom:1px solid var(--bd);padding:7px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.ri{display:flex;align-items:center;gap:7px;}
+.rl{font-size:10px;font-weight:700;letter-spacing:.07em;}
+.rl-u{color:var(--cu);} .rl-e{color:var(--ce);}
+.ri input{background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:4px 9px;color:var(--tx);font-family:'DM Sans',sans-serif;font-size:13px;font-weight:600;width:74px;text-align:center;outline:none;}
+.ri input:focus{border-color:var(--ac);}
+.rh{color:var(--mu);font-size:11px;margin-left:auto;}
+
+main{padding:16px;max-width:1160px;margin:0 auto;}
+.tc{display:none;} .tc.active{display:block;}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:9px;margin-bottom:16px;}
+.sc{background:var(--s);border:1px solid var(--bd);border-radius:11px;padding:12px 14px;}
+.sl{font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;margin-bottom:5px;}
+.sv{font-family:'Unbounded',sans-serif;font-size:16px;font-weight:600;}
+.cg{color:var(--gr);} .cb{color:var(--ac);} .cd{color:var(--gd);} .cr{color:var(--rd);}
+
+/* hint */
+.hint{background:rgba(79,142,255,.07);border:1px solid rgba(79,142,255,.2);border-radius:10px;padding:11px 15px;margin-bottom:12px;font-size:12px;color:var(--mu);line-height:1.7;}
+.hint strong{color:var(--ac);}
+.hcols{display:flex;gap:7px;flex-wrap:wrap;margin-top:7px;}
+.hcol{background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:3px 10px;font-size:11px;display:flex;gap:5px;align-items:center;}
+.hcol b{color:var(--tx);}
+
+/* upload */
+.upz{border:2px dashed var(--bd);border-radius:12px;padding:26px 20px;text-align:center;cursor:pointer;transition:all .2s;background:var(--s);margin-bottom:12px;}
+.upz:hover,.upz.over{border-color:var(--ac);background:rgba(79,142,255,.04);}
+.upz input{display:none;}
+.upz h3{font-size:14px;font-weight:500;margin-bottom:4px;}
+.upz p{font-size:12px;color:var(--mu);}
+.fl{background:rgba(0,229,160,.07);border:1px solid rgba(0,229,160,.2);border-radius:9px;padding:9px 14px;font-size:13px;color:var(--gr);margin-bottom:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.ftag{background:rgba(0,229,160,.14);border-radius:5px;padding:2px 7px;font-size:11px;}
+.fl .btn-clr{margin-left:auto;background:rgba(255,79,110,.12);border:1px solid rgba(255,79,110,.3);color:var(--rd);border-radius:5px;padding:2px 9px;font-size:11px;cursor:pointer;}
+.fl .btn-clr:hover{background:var(--rd);color:#fff;}
+
+/* save hint banner */
+.save-banner{background:rgba(0,229,160,.1);border:1px solid rgba(0,229,160,.3);border-radius:9px;padding:9px 14px;font-size:13px;color:var(--gr);margin-bottom:12px;display:none;align-items:center;gap:10px;}
+.save-banner button{background:var(--gr);color:#0b0d12;border:none;border-radius:6px;padding:5px 14px;font-weight:700;font-size:12px;cursor:pointer;}
+
+/* form */
+.sf{background:var(--s);border:1px solid var(--bd);border-radius:13px;padding:17px;margin-bottom:18px;}
+.ft{font-family:'Unbounded',sans-serif;font-size:10px;font-weight:700;color:var(--gr);margin-bottom:14px;letter-spacing:.06em;}
+.fg{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:11px;}
+.fg3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;margin-bottom:11px;}
+@media(max-width:560px){.fg,.fg3{grid-template-columns:1fr;}.tb{font-size:11px;padding:5px 8px;}}
+.fi2{display:flex;flex-direction:column;gap:5px;}
+.fi2 label{font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;}
+.fi2 input,.fi2 select{background:var(--s2);border:1px solid var(--bd);border-radius:8px;padding:9px 12px;color:var(--tx);font-family:'DM Sans',sans-serif;font-size:14px;outline:none;transition:border-color .2s;width:100%;}
+.fi2 input:focus,.fi2 select:focus{border-color:var(--ac);}
+
+/* autocomplete */
+.acw{position:relative;}
+.acl{position:absolute;top:100%;left:0;right:0;background:var(--s2);border:1px solid var(--ac);border-radius:9px;max-height:220px;overflow-y:auto;z-index:200;margin-top:3px;box-shadow:0 8px 24px rgba(0,0,0,.4);}
+.aci{padding:9px 13px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--bd);}
+.aci:last-child{border-bottom:none;}
+.aci:hover,.aci.sel{background:rgba(79,142,255,.15);}
+.aci .an{font-weight:500;}
+.aci .as{font-size:11px;color:var(--mu);margin-top:2px;}
+
+/* margin preview */
+.mp{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:11px 15px;display:flex;align-items:center;gap:14px;margin-bottom:11px;flex-wrap:wrap;}
+.mpi .mv{font-family:'Unbounded',sans-serif;font-size:14px;font-weight:600;}
+.mpi .ml{font-size:10px;color:var(--mu);margin-top:2px;}
+.mpa{color:var(--mu);font-size:16px;}
+
+/* delivery */
+.sb2{background:var(--s2);border:1px solid var(--bd);border-radius:10px;padding:13px;margin-bottom:11px;}
+.sb2t{font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;margin-bottom:11px;font-weight:500;}
+.di{font-size:12px;color:var(--mu);margin-top:7px;}
+
+.btn-p{background:var(--ac);color:#fff;width:100%;padding:11px;border:none;border-radius:9px;cursor:pointer;font-family:'DM Sans',sans-serif;font-size:14px;font-weight:500;transition:all .2s;}
+.btn-p:hover{background:#3a7aee;}
+.btn-p:disabled{background:var(--bd);color:var(--mu);cursor:not-allowed;}
+
+/* catalog */
+.si{background:var(--s2);border:1px solid var(--bd);border-radius:9px;padding:10px 14px;color:var(--tx);font-family:'DM Sans',sans-serif;font-size:14px;width:100%;margin-bottom:13px;outline:none;}
+.si:focus{border-color:var(--ac);}
+.cg2{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;}
+.cc{background:var(--s);border:1px solid var(--bd);border-radius:11px;padding:13px;transition:border-color .2s;}
+.cc:hover{border-color:var(--ac);}
+.ccb{font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;margin-bottom:3px;}
+.ccn{font-size:13px;font-weight:500;margin-bottom:9px;line-height:1.4;}
+.ccp{display:flex;gap:12px;font-size:12px;flex-wrap:wrap;margin-bottom:9px;}
+.ccpl{color:var(--mu);font-size:10px;}
+.ccpv{font-weight:600;}
+.stk-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;}
+.stk-row input{width:62px;background:var(--s2);border:1px solid var(--bd);border-radius:5px;padding:3px 7px;color:var(--tx);font-size:12px;text-align:center;outline:none;}
+.stk-row input:focus{border-color:var(--ac);}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:500;}
+.b-g{background:rgba(0,229,160,.15);color:var(--gr);}
+.b-b{background:rgba(79,142,255,.15);color:var(--ac);}
+.b-d{background:rgba(255,209,102,.15);color:var(--gd);}
+.b-r{background:rgba(255,79,110,.15);color:var(--rd);}
+.ct{display:inline-block;padding:1px 5px;border-radius:4px;font-size:10px;font-weight:700;}
+.ct-u{background:rgba(96,165,250,.2);color:var(--cu);}
+.ct-e{background:rgba(192,132,252,.2);color:var(--ce);}
+.ct-h{background:rgba(52,211,153,.2);color:var(--ch);}
+
+/* reports */
+.rg{display:grid;grid-template-columns:1fr 1fr;gap:13px;margin-bottom:18px;}
+@media(max-width:640px){.rg{grid-template-columns:1fr;}}
+.rc{background:var(--s);border:1px solid var(--bd);border-radius:13px;padding:16px;}
+.rc h3{font-family:'Unbounded',sans-serif;font-size:10px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.08em;margin-bottom:13px;}
+.rr{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bd);font-size:13px;}
+.rr:last-child{border-bottom:none;}
+.rn{flex:1;margin-right:8px;}
+.rv{font-weight:600;white-space:nowrap;}
+.dr{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap;align-items:flex-end;}
+.dr .fi2{flex:1;min-width:110px;}
+.dbtn{padding:8px 13px;background:var(--s2);border:1px solid var(--bd);color:var(--tx);border-radius:8px;cursor:pointer;font-family:'DM Sans',sans-serif;font-size:13px;white-space:nowrap;}
+.dbtn:hover{border-color:var(--ac);color:var(--ac);}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{padding:8px 12px;text-align:left;font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid var(--bd);font-weight:500;white-space:nowrap;}
+td{padding:9px 12px;border-bottom:1px solid var(--bd);vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+tr:hover td{background:rgba(255,255,255,.013);}
+.scr{max-height:360px;overflow-y:auto;}
+.empty{padding:44px 20px;text-align:center;color:var(--mu);}
+.empty .ei{font-size:40px;margin-bottom:10px;}
+.btn-x{padding:3px 8px;font-size:11px;border-radius:5px;border:1px solid var(--rd);background:transparent;color:var(--rd);cursor:pointer;}
+.btn-x:hover{background:var(--rd);color:#fff;}
+.toast{position:fixed;bottom:18px;right:18px;background:var(--gr);color:#0b0d12;padding:10px 16px;border-radius:9px;font-weight:600;font-size:13px;z-index:999;transform:translateY(70px);opacity:0;transition:all .3s;}
+.toast.show{transform:translateY(0);opacity:1;}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<header>
+  <div class="logo">SALES<span>TRACK</span></div>
+  <nav>
+    <button class="tb active" onclick="switchTab('sale',this)">📦 Продаж</button>
+    <button class="tb" onclick="switchTab('catalog',this)">📋 Склад</button>
+    <button class="tb" onclick="switchTab('reports',this)">📊 Звіти</button>
+    <button class="btn-save" onclick="saveFile()">💾 Зберегти файл</button>
+  </nav>
+</header>
+
+<div class="rates">
+  <div class="ri"><span class="rl rl-u">USD</span><input id="r-usd" type="number" value="41.5" step="0.1"><span style="font-size:11px;color:var(--mu)">₴</span></div>
+  <div class="ri"><span class="rl rl-e">EUR</span><input id="r-eur" type="number" value="45.0" step="0.1"><span style="font-size:11px;color:var(--mu)">₴</span></div>
+  <span class="rh">Після змін — натисни 💾 Зберегти файл</span>
+</div>
+
+<main>
+
+<!-- ПРОДАЖ -->
+<div class="tc active" id="tab-sale">
+  <div class="stats">
+    <div class="sc"><div class="sl">Продажів сьогодні</div><div class="sv cb" id="st-c">0</div></div>
+    <div class="sc"><div class="sl">Виручка (₴)</div><div class="sv cd" id="st-r">0 ₴</div></div>
+    <div class="sc"><div class="sl">Маржа (₴)</div><div class="sv cg" id="st-m">0 ₴</div></div>
+    <div class="sc"><div class="sl">Маржа %</div><div class="sv cg" id="st-p">0%</div></div>
+    <div class="sc"><div class="sl">Доставка (₴)</div><div class="sv cr" id="st-d">0 ₴</div></div>
+  </div>
+
+  <div class="hint">
+    <strong>Формат Excel файлу</strong> — 4 колонки, без заголовків:
+    <div class="hcols">
+      <div class="hcol"><b>A</b><span>Артикул</span></div>
+      <div class="hcol"><b>B</b><span>Назва товару</span></div>
+      <div class="hcol"><b>C</b><span>Ціна закупки</span></div>
+      <div class="hcol"><b>D</b><span>Валюта: USD / EUR / UAH</span></div>
+    </div>
+  </div>
+
+  <div class="upz" id="upz" onclick="document.getElementById('finp').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="onDrop(event)">
+    <input type="file" id="finp" multiple="" accept=".xls,.xlsx" onchange="handleFiles(this.files)">
+    <div style="font-size:32px;margin-bottom:8px">📂</div>
+    <h3>Завантажте прайс-листи</h3>
+    <p>XLS / XLSX · Перетягніть або натисніть</p>
+  </div>
+
+  <div id="save-banner" class="save-banner" style="display: flex;">
+    ✅ Товари додано! Збережи файл щоб не втратити.
+    <button onclick="saveFile()">💾 Зберегти зараз</button>
+  </div>
+  <div id="fs"><div class="fl">✅ 200 товарів · <span class="ftag">📄 Pelengas прайс.xlsx</span><button class="btn-clr" onclick="clearCatalog()">Очистити</button></div></div>
+
+  <div class="sf">
+    <div class="ft">⚡ НОВИЙ ПРОДАЖ</div>
+    <div style="margin-bottom:11px">
+      <div class="fi2">
+        <label>Товар</label>
+        <div class="acw">
+          <input type="text" id="pi" placeholder="Назва або артикул..." autocomplete="off" oninput="searchP(this.value)" onkeydown="onKey(event)">
+          <div class="acl" id="acl" style="display:none"></div>
+        </div>
+      </div>
+    </div>
+    <div class="fg">
+      <div class="fi2"><label>Ціна продажу (₴)</label><input type="number" id="sp" placeholder="0.00" step="0.01" oninput="updateMP();chkBtn()"></div>
+      <div class="fi2"><label>Кількість</label><input type="number" id="sq" value="1" min="1" oninput="updateMP()"></div>
+    </div>
+    <div class="mp" id="mp" style="display:none">
+      <div class="mpi"><div class="mv cb" id="mpc">—</div><div class="ml">Закупка (₴)</div></div>
+      <div class="mpa">→</div>
+      <div class="mpi"><div class="mv cd" id="mps">—</div><div class="ml">Продаж (₴)</div></div>
+      <div class="mpa">→</div>
+      <div class="mpi"><div class="mv" id="mpm">—</div><div class="ml">Маржа ₴</div></div>
+      <div class="mpi"><div class="mv" id="mpp">—</div><div class="ml">Маржа %</div></div>
+      <div class="mpi" id="mpsk" style="display:none"><div class="mv" id="mpskv">—</div><div class="ml">Залишок після</div></div>
+    </div>
+    <div class="sb2">
+      <div class="sb2t">🚚 Доставка</div>
+      <div class="fg3">
+        <div class="fi2"><label>К-сть пересилок</label><input type="number" id="dc" value="0" min="0" oninput="updDel()"></div>
+        <div class="fi2"><label>Вартість одн. (₴)</label><input type="number" id="dv" value="80" step="1" oninput="updDel()"></div>
+        <div class="fi2"><label>Плачу я (₴)</label><input type="number" id="dp" value="0" step="1" oninput="updDel()"></div>
+      </div>
+      <div class="di" id="di">Клієнт оплачує доставку</div>
+    </div>
+    <div class="fg" style="margin-bottom:11px">
+      <div class="fi2"><label>Покупець</label><input type="text" id="sbu" placeholder="Ім'я або опис"></div>
+      <div class="fi2"><label>Нотатка</label><input type="text" id="sno" placeholder="Оптовий, знижка…"></div>
+    </div>
+    <button class="btn-p" id="add-btn" onclick="addSale()" disabled="">Додати продаж</button>
+  </div>
+</div>
+
+<!-- СКЛАД -->
+<div class="tc" id="tab-catalog">
+  <input class="si" type="text" placeholder="🔍 Пошук по каталогу..." oninput="renderCat(this.value)">
+  <div class="cg2" id="catg">
+    <div class="empty" style="grid-column:1/-1"><div class="ei">📂</div><p>Завантажте прайс-листи</p></div>
+  </div>
+</div>
+
+<!-- ЗВІТИ -->
+<div class="tc" id="tab-reports">
+  <div class="dr">
+    <div class="fi2">
+      <label style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;display:block;margin-bottom:5px">Від</label>
+      <input type="date" id="rf" onchange="renderRep()">
+    </div>
+    <div class="fi2">
+      <label style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.07em;display:block;margin-bottom:5px">До</label>
+      <input type="date" id="rt" onchange="renderRep()">
+    </div>
+    <button class="dbtn" onclick="setToday()">Сьогодні</button>
+    <button class="dbtn" onclick="setMonth()">Місяць</button>
+    <button class="dbtn" onclick="setAll()">Всі</button>
+  </div>
+  <div class="rg">
+    <div class="rc"><h3>📈 Топ товарів</h3><div id="r-top" class="scr"></div></div>
+    <div class="rc"><h3>💰 Підсумок</h3><div id="r-sum"></div></div>
+    <div class="rc" style="grid-column:1/-1"><h3>⚠️ Мало на складі</h3><div id="r-low"></div></div>
+    <div class="rc" style="grid-column:1/-1">
+      <h3>📋 Всі продажі</h3>
+      <div class="scr">
+        <table><thead><tr>
+          <th>Дата</th><th>Товар</th><th>Арт.</th><th>К-сть</th><th>Закупка</th><th>Продаж ₴</th><th>Маржа ₴</th><th>%</th><th>Дост.</th><th>Нотатка</th><th></th>
+        </tr></thead><tbody id="r-tb"></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+</main>
+<div class="toast" id="toast">✅ +200 товарів. Натисни 💾 Зберегти!</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// ВБУДОВАНІ ДАНІ — зберігаються прямо в цьому файлі
+// Не редагуй вручну. Натисни "💾 Зберегти файл" після змін.
+// ═══════════════════════════════════════════════════════════════
+var _products = [{"sku":"PEL-001","name":"Ружье подводное Pelengas Eco Magnum","brand":"Pelengas","optPrice":84,"currency":"USD"},{"sku":"PEL-002","name":"Ружье подводное Pelengas Carbon Max 120","brand":"Pelengas","optPrice":346.5,"currency":"USD"},{"sku":"PEL-003","name":"Ружье подводное Pelengas VARVAR  Profi 55","brand":"Pelengas","optPrice":241.5,"currency":"USD"},{"sku":"PEL-004","name":"Ружье подводное Pelengas VARVAR  Profi  70","brand":"Pelengas","optPrice":252,"currency":"USD"},{"sku":"PEL-005","name":"Ружье подводное Pelengas Magnum PROFI 55","brand":"Pelengas","optPrice":215.25,"currency":"USD"},{"sku":"PEL-006","name":"Ружье подводное Pelengas Magnum PROFI 70","brand":"Pelengas","optPrice":226.8,"currency":"USD"},{"sku":"PEL-007","name":"Ружье подводное Pelengas Magnum PROFI смещенная рукоять 55","brand":"Pelengas","optPrice":220.5,"currency":"USD"},{"sku":"PEL-008","name":"Ружье подводное Pelengas Magnum PROFI смещенная рукоять  70","brand":"Pelengas","optPrice":232.05,"currency":"USD"},{"sku":"PEL-009","name":"Ружье подводное Pelengas Magnum White Edition (с белой рукояткой и белым рогом намотки линя)","brand":"Pelengas","optPrice":157.5,"currency":"USD"},{"sku":"PEL-010","name":"Ружье подводное Pelengas Z-linka 55 с торцевой рукояткой","brand":"Pelengas","optPrice":189,"currency":"USD"},{"sku":"PEL-011","name":"Ружье подводное Pelengas Model T","brand":"Pelengas","optPrice":126,"currency":"USD"},{"sku":"PEL-012","name":"Ружье подводное Pelengas Z-linka 55 со смещенной рукоять максимальной комплектации с насосом","brand":"Pelengas","optPrice":189,"currency":"USD"},{"sku":"PEL-013","name":"Ружье подводное Pelengas Z-linka 70 со смещенной рукоять максимальной комплектации с насосом","brand":"Pelengas","optPrice":204.75,"currency":"USD"},{"sku":"PEL-014","name":"Ружье подводное Pelengas Magnum Plus 45 (без комплектации, только ружье, инструкия и упаковка)","brand":"Pelengas","optPrice":105,"currency":"USD"},{"sku":"PEL-015","name":"Ружье подводное Pelengas Magnum Plus 55 (без комплектации, только ружье, инструкия и упаковка)","brand":"Pelengas","optPrice":125,"currency":"USD"},{"sku":"PEL-017","name":"Ружье подводное Pelengas 40 Magnum","brand":"Pelengas","optPrice":131.25,"currency":"USD"},{"sku":"PEL-018","name":"Ружье подводное Pelengas 55 Magnum","brand":"Pelengas","optPrice":157.5,"currency":"USD"},{"sku":"PEL-019","name":"Ружье подводное Pelengas 70 Magnum","brand":"Pelengas","optPrice":169.05,"currency":"USD"},{"sku":"PEL-020","name":"Ружье подводное Pelengas 90 Magnum","brand":"Pelengas","optPrice":179.55,"currency":"USD"},{"sku":"PEL-021","name":"Ружье подводное Pelengas 110 Magnum","brand":"Pelengas","optPrice":200.55,"currency":"USD"},{"sku":"PEL-022","name":"Ружье подводное Pelengas 45 Magnum Plus","brand":"Pelengas","optPrice":131.25,"currency":"USD"},{"sku":"PEL-023","name":"Ружье подводное Pelengas 55 Magnum Plus","brand":"Pelengas","optPrice":157.5,"currency":"USD"},{"sku":"PEL-024","name":"Ружье подводное Pelengas 70 Magnum Plus","brand":"Pelengas","optPrice":168,"currency":"USD"},{"sku":"PEL-025","name":"Ружье подводное Pelengas 55 Magnum Plus рукоятка 1/3","brand":"Pelengas","optPrice":168,"currency":"USD"},{"sku":"PEL-026","name":"Ружье подводное Pelengas 55 Magnum Plus рукоятка 50/50","brand":"Pelengas","optPrice":168,"currency":"USD"},{"sku":"PEL-027","name":"Ружье подводное Pelengas 55 Magnum Plus смещенная рукоятка 2/3","brand":"Pelengas","optPrice":168,"currency":"USD"},{"sku":"PEL-028","name":"Ружье подводное Pelengas 70 Magnum Plus смещенная рукоятка","brand":"Pelengas","optPrice":183.75,"currency":"USD"},{"sku":"PEL-029","name":"Ружье подводное Pelengas 100 Magnum Plus","brand":"Pelengas","optPrice":194.25,"currency":"USD"},{"sku":"PEL-030","name":"Ружье подводное Pelengas 100 Magnum Plus смещенная рукоятка","brand":"Pelengas","optPrice":204.75,"currency":"USD"},{"sku":"PEL-031","name":"Ружье подводное Pelengas 140 Magnum Plus смещенная рукоятка","brand":"Pelengas","optPrice":241.5,"currency":"USD"},{"sku":"PEL-032","name":"Накладка на гидрокостюм для крепления ножа","brand":"Pelengas","optPrice":6.3,"currency":"USD"},{"sku":"PEL-033","name":"Нож с магнитным креплением Pelengas Volga серрейтор-серрейтор","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-034","name":"Нож с магнитным креплением Pelengas Universal Maestro","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-035","name":"Нож с магнитным креплением Pelengas Universal Maestro WE с белыми ножнами и рукояткой","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-036","name":"Нож с магнитным креплением Pelengas Volga WE с белыми ножнами и рукояткой серрейтор-серрейтор","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-037","name":"Нож с магнитным креплением Pelengas Volga WE с белыми ножнами и рукояткой серрейтор-плейн","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-038","name":"Нож с магнитным креплением Pelengas Volga серрейтор-плейн","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-040","name":"Катушка TROPHY  П-образная консольная NEW","brand":"Pelengas","optPrice":31.5,"currency":"USD"},{"sku":"PEL-041","name":"Катушка  П-образная консольная ICE","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-042","name":"Катушка  П-образная консольная NEW","brand":"Pelengas","optPrice":26.25,"currency":"USD"},{"sku":"PEL-043","name":"Катушка комбинированная с нержавеющим кронштейном и креплением камеры","brand":"Pelengas","optPrice":16.8,"currency":"USD"},{"sku":"PEL-044","name":"Катушка комбинированная с нержавеющим кронштейном с боковым выходом линя","brand":"Pelengas","optPrice":16.8,"currency":"USD"},{"sku":"PEL-045","name":"Катушка комбинированная с нержавеющим кронштейном","brand":"Pelengas","optPrice":16.8,"currency":"USD"},{"sku":"PEL-046","name":"Катушка пластиковая","brand":"Pelengas","optPrice":11.55,"currency":"USD"},{"sku":"PEL-047","name":"Катушка алюминиевая с нержавеющим кронштейном 55мм","brand":"Pelengas","optPrice":22.05,"currency":"USD"},{"sku":"PEL-048","name":"Катушка алюминиевая с нержавеющим кронштейном 55мм (для ружья Pelengas)","brand":"Pelengas","optPrice":22.05,"currency":"USD"},{"sku":"PEL-049","name":"Катушка алюминиевая с нержавеющим кронштейном 65мм","brand":"Pelengas","optPrice":23.1,"currency":"USD"},{"sku":"PEL-050","name":"Катушка алюминиевая с нержавеющим кронштейном 65мм (для ружья Pelengas)","brand":"Pelengas","optPrice":23.1,"currency":"USD"},{"sku":"PEL-051","name":"Катушка алюминиевая с нержавеющим кронштейном 75мм","brand":"Pelengas","optPrice":18.9,"currency":"USD"},{"sku":"PEL-052","name":"Набор \"Magnum\" (гарпун с лепестками, резьбой и скручивающимися бойками, 7 мм, каленый + скользящая втулка, длина -  500)","brand":"Pelengas","optPrice":21,"currency":"USD"},{"sku":"PEL-053","name":"Набор \"Magnum\" (гарпун с лепестками, резьбой и скручивающимися бойками, 7 мм, каленый + скользящая втулка, длина -  700)","brand":"Pelengas","optPrice":22,"currency":"USD"},{"sku":"PEL-054","name":"Набор \"Таити\" (гарпун таитянского типа, 7 мм, каленый + скользящая втулка, длина -  500)","brand":"Pelengas","optPrice":18,"currency":"USD"},{"sku":"PEL-055","name":"Набор \"Таити\" (гарпун таитянского типа, 7 мм, каленый + скользящая втулка, длина -  700)","brand":"Pelengas","optPrice":19,"currency":"USD"},{"sku":"PEL-056","name":"Набор \"Таити\" каленый гарпун(сталь Sandvik 7,5 мм и титановая скользящая втулка 500","brand":"Pelengas","optPrice":23,"currency":"USD"},{"sku":"PEL-057","name":"Набор \"Таити\" каленый гарпун(сталь Sandvik 7,5 мм и титановая скользящая втулка 700","brand":"Pelengas","optPrice":24,"currency":"USD"},{"sku":"PEL-058","name":"Набор \"Таити\" каленый гарпун(сталь Sandvik 7мм и титановая скользящая втулка 1000","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-059","name":"Гарпун каленый (сталь Sandvik) 7 мм 450 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":9,"currency":"USD"},{"sku":"PEL-060","name":"Гарпун каленый (сталь Sandvik)  7 мм 500 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-061","name":"Гарпун каленый (сталь Sandvik)  7 мм 700 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":11,"currency":"USD"},{"sku":"PEL-062","name":"Гарпун каленый (сталь Sandvik)  7 мм 500 Pelengas Z-linka","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-063","name":"Гарпун каленый (сталь Sandvik)  7 мм 700 Pelengas Z-linka","brand":"Pelengas","optPrice":11,"currency":"USD"},{"sku":"PEL-064","name":"Гарпун каленый (сталь Sandvik) 7 мм 1000 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":16,"currency":"USD"},{"sku":"PEL-065","name":"Гарпун каленый (сталь Sandvik) 7,5 мм 500 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":13,"currency":"USD"},{"sku":"PEL-066","name":"Гарпун каленый (сталь Sandvik) 7,5 мм 700 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":14,"currency":"USD"},{"sku":"PEL-067","name":"Гарпун нержавеющий 7 мм 450 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-068","name":"Гарпун 7 мм нержавеющий 500 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-069","name":"Гарпун 7 мм нержавеющий 700 Pelengas, Mares Cyrano и др.","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-070","name":"Гарпун с полиуретановым тормозом 400 Mares, Omer, Beuchat, Tigullio","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-071","name":"Гарпун с полиуретановым тормозом 500 Mares, Omer, Beuchat, Tigullio","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-072","name":"Гарпун с полиуретановым тормозом 700 Mares, Omer, Beuchat, Tigullio","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-073","name":"Гарпун с полиуретановым тормозом 400 Cressi, Asso, Seac Sub","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-074","name":"Гарпун с полиуретановым тормозом 500 Cressi, Asso, Seac Sub","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-075","name":"Гарпун с полиуретановым тормозом 700 Cressi, Asso, Seac Sub","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-076","name":"Гарпун с каленым хвостовиком 400 Mares, Omer, Beuchat, Tigullio","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-077","name":"Гарпун с каленым хвостовиком 500 Mares, Omer, Beuchat, Tigullio","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-078","name":"Наконечник  со скручивающейся насадкой 3-х гранный 1 лепесток","brand":"Pelengas","optPrice":8.5,"currency":"USD"},{"sku":"PEL-079","name":"Наконечник  со скручивающейся насадкой 3-х гранный 2 лепестка","brand":"Pelengas","optPrice":9.5,"currency":"USD"},{"sku":"PEL-080","name":"Наконечник  со скручивающейся насадкой Корона 1 лепесток","brand":"Pelengas","optPrice":8.5,"currency":"USD"},{"sku":"PEL-081","name":"Наконечник  со скручивающейся насадкой Корона 2 лепестка","brand":"Pelengas","optPrice":9.5,"currency":"USD"},{"sku":"PEL-082","name":"Скручивающийся боек \"Корона\"","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-083","name":"Скручивающийся боек \"Дюбель\"","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-084","name":"Скручивающийся боек \"3-х гранный\"","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-085","name":"Наконечник с дюбелем для охоты в камнях","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-086","name":"Наконечник с дюбелем для охоты в камнях","brand":"Pelengas","optPrice":11,"currency":"USD"},{"sku":"PEL-087","name":"Наконечник \"Корона\" 2 лепестка","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-088","name":"Наконечник 3-х гранный 1 лепесток (от 50 шт)","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-089","name":"Наконечник 3-х гранный 1 лепесток (до 50 шт)","brand":"Pelengas","optPrice":9,"currency":"USD"},{"sku":"PEL-090","name":"Наконечник 3-х гранный 2 лепестка (от 50 шт)","brand":"Pelengas","optPrice":9,"currency":"USD"},{"sku":"PEL-091","name":"Наконечник 3-х гранный 2 лепестка (до 50 шт)","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-092","name":"Наконечник 3-х гранный модернизированый 1 лепесток (до 50 шт)","brand":"Pelengas","optPrice":9,"currency":"USD"},{"sku":"PEL-093","name":"Наконечник 3-х гранный модернизированый 2 лепестка","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-094","name":"Скользящая втулка 7 мм NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-095","name":"Скользящая втулка 8 мм NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-096","name":"Скользящая втулка с гидротормозом 7 мм NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-097","name":"Скользящая втулка с гидротормозом 8 мм NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-098","name":"Скользящая втулка Titanium 7 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-099","name":"Скользящая втулка Titanium 8 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-100","name":"Скользящая втулка Titanium с гидротормозом 7 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-101","name":"Скользящая втулка Titanium с гидротормозом 7,5 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-102","name":"Скользящая втулка Titanium с гидротормозом 8 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-103","name":"Магнитный линесброс РЕГУЛИРУЕМЫЙ Pelengas","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-104","name":"Магнитный линесброс РЕГУЛИРУЕМЫЙ Cressi","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-105","name":"Магнитный линесброс РЕГУЛИРУЕМЫЙ Omer, Asso","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-106","name":"Магнитный линесброс РЕГУЛИРУЕМЫЙMares","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-107","name":"Магнитный линесброс РЕГУЛИРУЕМЫЙ Beuchat, Tigullio","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-108","name":"Магнитный линесброс Pelengas","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-109","name":"Магнитный линесброс Cressi","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-110","name":"Магнитный линесброс Omer, Asso","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-111","name":"Магнитный линесброс Mares","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-112","name":"Магнитный линесброс Beuchat, Tigullio","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-113","name":"Лопасти чистый карбон Soft (жесткость от 1,0 до 1,3)","brand":"Pelengas","optPrice":120,"currency":"USD"},{"sku":"PEL-114","name":"Лопасти чистый карбон Medium (жесткость от 1,4 до 1,6)","brand":"Pelengas","optPrice":120,"currency":"USD"},{"sku":"PEL-115","name":"Лопасти чистый карбон Hard (жесткость от 1,7 до 2,0)","brand":"Pelengas","optPrice":120,"currency":"USD"},{"sku":"PEL-116","name":"Ласты Pelengas с пластиковыми лопастями SOFT (серые) (собранные с калошами 43-45)","brand":"Pelengas","optPrice":52.8,"currency":"USD"},{"sku":"PEL-117","name":"Ласты Pelengas с пластиковыми лопастями MEDIUM (черные) (собранные с калошами 43-45)","brand":"Pelengas","optPrice":52.8,"currency":"USD"},{"sku":"PEL-118","name":"Ласты Pelengas с пластиковыми лопастями SOFT (серые) (собранные с калошами 46-48)","brand":"Pelengas","optPrice":52.8,"currency":"USD"},{"sku":"PEL-119","name":"Ласты Pelengas с пластиковыми лопастями MEDIUM (черные) (собранные с калошами 46-48)","brand":"Pelengas","optPrice":52.8,"currency":"USD"},{"sku":"PEL-120","name":"Калоши резиновые Pelengas 46-48 (пара)","brand":"Pelengas","optPrice":38,"currency":"USD"},{"sku":"PEL-121","name":"Отбортовка для лопастей","brand":"Pelengas","optPrice":4.5,"currency":"USD"},{"sku":"PEL-122","name":"Крепление для ласт (2 шт)","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-123","name":"Лопасти Pelengas карбон Soft","brand":"Pelengas","optPrice":84,"currency":"USD"},{"sku":"PEL-124","name":"Лопасти Pelengas карбон Medium","brand":"Pelengas","optPrice":84,"currency":"USD"},{"sku":"PEL-125","name":"Лопасти Pelengas карбон Hard","brand":"Pelengas","optPrice":84,"currency":"USD"},{"sku":"PEL-126","name":"Пневмовакуумный надульник на Pelengas ECO","brand":"Pelengas","optPrice":11,"currency":"USD"},{"sku":"PEL-127","name":"Пневмовакуумный набор Omer 50, 58 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-128","name":"Пневмовакуумный набор Cressi 55 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-129","name":"Пневмовакуумный набор Mares Cyrano 55","brand":"Pelengas","optPrice":35,"currency":"USD"},{"sku":"PEL-130","name":"Пневмовакуумный набор Beuchat 55, 58 (без поршня)","brand":"Pelengas","optPrice":35,"currency":"USD"},{"sku":"PEL-131","name":"Пневмовакуумный набор Asso 50 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-132","name":"Пневмовакуумный набор Tigullio 50 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-133","name":"Пневмовакуумный набор Omer 70 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-134","name":"Пневмовакуумный набор Cressi 70 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-135","name":"Пневмовакуумный набор Mares Cyrano 70","brand":"Pelengas","optPrice":35,"currency":"USD"},{"sku":"PEL-136","name":"Пневмовакуумный набор Beuchat 70 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-137","name":"Пневмовакуумный набор Asso 70 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-138","name":"Пневмовакуумный набор Tigullio 70 (без поршня)","brand":"Pelengas","optPrice":30,"currency":"USD"},{"sku":"PEL-139","name":"Кукан \"Безопасный\" Трофей","brand":"Pelengas","optPrice":18,"currency":"USD"},{"sku":"PEL-140","name":"Кукан \"Безопасный\" PROFI с полиуретановой оплеткой","brand":"Pelengas","optPrice":12,"currency":"USD"},{"sku":"PEL-141","name":"Кукан \"Безопасный\" с капроновым шнуром (от 10 штук)","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-142","name":"Иглоприемник","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-146","name":"Заряжалка пластиковая","brand":"Pelengas","optPrice":1.2,"currency":"USD"},{"sku":"PEL-147","name":"Безопасная заряжалка 12 мм","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-148","name":"Безопасная заряжалка 14 мм","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-149","name":"Универсальное крепление-поплавок для фонарей Feri W155, Hunterprolight и других мастеровых фонарей","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-150","name":"Универсальное крепление-поплавок под ресивер 32 мм","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-151","name":"Шар-поплавок на рузгрузку, ключи от лодки и т.д.","brand":"Pelengas","optPrice":2,"currency":"USD"},{"sku":"PEL-152","name":"Ручка-поплавок для ружей Cressi","brand":"Pelengas","optPrice":1,"currency":"USD"},{"sku":"PEL-153","name":"Универсальное крепление-поплавок под фонари","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-154","name":"Универсальное крепление-поплавок под фонари Mares Cyrano","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-155","name":"Крепление-поплавок под фонари (CREE XML, MJ810, MJ810E и др) NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-156","name":"Крепление-поплавок под фонари Mares Cyrano (CREE XML, MJ810, MJ810E и др) NEW","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-157","name":"Крепление-поплавок под фонари FEREI","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-158","name":"Крепление-поплавок под фонари (CREE XML, MJ810, MJ810E и др)","brand":"Pelengas","optPrice":1,"currency":"USD"},{"sku":"PEL-159","name":"Крепление-поплавок под фонари Mares Cyrano (CREE XML, MJ810, MJ810E и др)","brand":"Pelengas","optPrice":1,"currency":"USD"},{"sku":"PEL-160","name":"Поплавок-крыло (2 шт)","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-161","name":"Поплавок-крыло (2 шт) для Mares Cyrano","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-162","name":"Клапан Виноградова на трубку","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-163","name":"Линь Dayneema 1,6 mm","brand":"Pelengas","optPrice":0.25,"currency":"USD"},{"sku":"PEL-164","name":"Линь Dayneema 2 mm","brand":"Pelengas","optPrice":0.34,"currency":"USD"},{"sku":"PEL-165","name":"Линь капроновый 1,6 mm NEW","brand":"Pelengas","optPrice":0.15,"currency":"USD"},{"sku":"PEL-166","name":"Линь капроновый 2 mm NEW","brand":"Pelengas","optPrice":0.15,"currency":"USD"},{"sku":"PEL-167","name":"Брасовый ремень","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-168","name":"Пояс резиновый с марсельской пряжкой (от 30 шт)","brand":"Pelengas","optPrice":6.4,"currency":"USD"},{"sku":"PEL-169","name":"Пояс резиновый с марсельской пряжкой (до 30 шт)","brand":"Pelengas","optPrice":7.05,"currency":"USD"},{"sku":"PEL-170","name":"Манжета вакуумная","brand":"Pelengas","optPrice":0.6,"currency":"USD"},{"sku":"PEL-171","name":"Манжета вакуумная NEW","brand":"Pelengas","optPrice":0.6,"currency":"USD"},{"sku":"PEL-172","name":"Клапан с гидрозатвором NEW","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-173","name":"Клапан Сетка на трубку","brand":"Pelengas","optPrice":8,"currency":"USD"},{"sku":"PEL-174","name":"Масло для подводных ружей","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-175","name":"Мотовило для защиты гарпуна и хранения линя","brand":"Pelengas","optPrice":2,"currency":"USD"},{"sku":"PEL-176","name":"Крепление камеры на подводное ружье","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-177","name":"Манометр для ружей Pelengas","brand":"Pelengas","optPrice":18,"currency":"USD"},{"sku":"PEL-178","name":"Ключ Pelengas Мастер","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-179","name":"Чехол для пневматических подводных ружей 50, 55 и 60 см.","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-180","name":"Чехол для пневматических подводных ружей 70 и 75 см.","brand":"Pelengas","optPrice":14,"currency":"USD"},{"sku":"PEL-181","name":"Клапан Виноградова на трубку","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-182","name":"Карабин  Picasso","brand":"Pelengas","optPrice":2,"currency":"USD"},{"sku":"PEL-183","name":"D-кольцо","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-184","name":"D-кольцо с карабином","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-185","name":"Амортизатор линя без вертлюга","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-186","name":"Амортизатор линя с вертлюгом и карабином","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-187","name":"Амортизатор линя с вертлюгом и карабином Picasso","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-188","name":"Ключ для разборки Z-linka Pelengas Master","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-189","name":"Линесброс нержавеющий боковой для ружей Pelengas","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-190","name":"Спусковой крючок нержавеющий Pelengas","brand":"Pelengas","optPrice":5,"currency":"USD"},{"sku":"PEL-191","name":"Поршень полиуретановый (ствол 13 мм) (Mares Jet, Omer, Beuchat, Tigullio)","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-192","name":"Поршень полиуретановый (ствол 13 мм) (Cressi, Asso)","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-193","name":"Поршень для ружей Pelengas Magnum NEW","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-194","name":"Пластиковая часть поршня Magnum","brand":"Pelengas","optPrice":1.5,"currency":"USD"},{"sku":"PEL-195","name":"Поршень для ружей Pelengas","brand":"Pelengas","optPrice":4,"currency":"USD"},{"sku":"PEL-196","name":"Ремкомплект для ружей Pelengas Z-linka","brand":"Pelengas","optPrice":7,"currency":"USD"},{"sku":"PEL-197","name":"Ремкомплект для ружей Pelengas Z-linka Profi (+гермоввод и ключ Master)","brand":"Pelengas","optPrice":16,"currency":"USD"},{"sku":"PEL-198","name":"Ремкомплект для ружей Pelengas","brand":"Pelengas","optPrice":11,"currency":"USD"},{"sku":"PEL-199","name":"Надульник с отверстиями для выхода воды","brand":"Pelengas","optPrice":9,"currency":"USD"},{"sku":"PEL-200","name":"Гайка-фиксатор вакуумной манжеты","brand":"Pelengas","optPrice":3,"currency":"USD"},{"sku":"PEL-201","name":"Насос для ружей Pelengas","brand":"Pelengas","optPrice":10,"currency":"USD"},{"sku":"PEL-202","name":"Рукоятка для ружей Pelengas","brand":"Pelengas","optPrice":15,"currency":"USD"},{"sku":"PEL-203","name":"Поршень полиуретановый (ствол 11 мм) (Mares Cyrano, Spark Mimetic, Акула)","brand":"Pelengas","optPrice":6,"currency":"USD"},{"sku":"PEL-204","name":"Демпфер полиуретановый (ствол 13 мм) (Mares Sten, Jet, Omer, Cressi, Beuchat, Asso, Tigullio)","brand":"Pelengas","optPrice":2,"currency":"USD"},{"sku":"PEL-205","name":"Демпфер полиуретановый (ствол 11 мм) (Mares Cyrano, Spark Mimetic, Акула)","brand":"Pelengas","optPrice":2,"currency":"USD"}];
+var _sales    = [];
+var _stock    = {};
+var _fnames   = [];
+var _usd      = "41.5";
+var _eur      = "45.0";
+// ═══════════════════════════════════════════════════════════════
+
+// ─── STATE
+let products = JSON.parse(JSON.stringify(_products));
+let sales    = JSON.parse(JSON.stringify(_sales));
+let stock    = JSON.parse(JSON.stringify(_stock));
+let fnames   = JSON.parse(JSON.stringify(_fnames));
+let sel = null, acArr = [], acI = -1;
+
+// ─── INIT
+document.getElementById('r-usd').value = _usd;
+document.getElementById('r-eur').value = _eur;
+updStats();
+showFS();
+
+// ─── RATES
+function getRate(c){
+  if(c==='USD') return +document.getElementById('r-usd').value||41.5;
+  if(c==='EUR') return +document.getElementById('r-eur').value||45;
+  return 1;
+}
+function toUAH(a,c){return a*getRate(c);}
+
+// ─── SAVE FILE (головна фішка — зберігає дані в HTML)
+function saveFile(){
+  const usd = document.getElementById('r-usd').value;
+  const eur = document.getElementById('r-eur').value;
+  let html = document.documentElement.outerHTML;
+
+  // Замінюємо вбудовані змінні на поточні дані
+  html = replaceVar(html, '_products', products);
+  html = replaceVar(html, '_sales',    sales);
+  html = replaceVar(html, '_stock',    stock);
+  html = replaceVar(html, '_fnames',   fnames);
+  html = replaceStrVar(html, '_usd', usd);
+  html = replaceStrVar(html, '_eur', eur);
+
+  const blob = new Blob([html], {type:'text/html;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'SalesTrack.html';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  hideBanner();
+  showToast('💾 Файл збережено! Відкрий скачаний файл.');
+}
+
+function replaceVar(html, varName, data){
+  const start = html.indexOf('var ' + varName + ' = ');
+  if(start === -1) return html;
+  const end = html.indexOf(';', start);
+  if(end === -1) return html;
+  return html.substring(0, start) + 'var ' + varName + ' = ' + JSON.stringify(data) + html.substring(end);
+}
+function replaceStrVar(html, varName, val){
+  const start = html.indexOf('var ' + varName + ' = ');
+  if(start === -1) return html;
+  const end = html.indexOf(';', start);
+  if(end === -1) return html;
+  return html.substring(0, start) + 'var ' + varName + ' = "' + val + '"' + html.substring(end);
+}
+
+function showBanner(){document.getElementById('save-banner').style.display='flex';}
+function hideBanner(){document.getElementById('save-banner').style.display='none';}
+
+// ─── TABS
+function switchTab(t,btn){
+  document.querySelectorAll('.tc').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tb').forEach(x=>x.classList.remove('active'));
+  document.getElementById('tab-'+t).classList.add('active');
+  btn.classList.add('active');
+  if(t==='catalog') renderCat();
+  if(t==='reports'){initDates();renderRep();}
+}
+
+// ─── FILE UPLOAD
+function onDrop(e){
+  e.preventDefault();
+  document.getElementById('upz').classList.remove('over');
+  handleFiles(e.dataTransfer.files);
+}
+
+function handleFiles(files){
+  Array.from(files).forEach(file=>{
+    const r = new FileReader();
+    r.onload = ev => {
+      try{
+        const wb = XLSX.read(ev.target.result,{type:'array'});
+        let added=0, updated=0;
+        wb.SheetNames.forEach(sh=>{
+          const rows = XLSX.utils.sheet_to_json(wb.Sheets[sh],{header:1,defval:''});
+          const brand = getBrand(file.name, sh);
+          parseSheet(rows, brand).forEach(p=>{
+            const key = p.sku||p.name;
+            const idx = products.findIndex(x=>(x.sku||x.name)===key);
+            if(idx>=0){products[idx]={...products[idx],...p};updated++;}
+            else{products.push(p);added++;}
+          });
+        });
+        if(!fnames.includes(file.name)) fnames.push(file.name);
+        showFS();
+        showBanner();
+        showToast('✅ +'+added+' товарів. Натисни 💾 Зберегти!');
+      }catch(err){
+        showToast('❌ Помилка: '+err.message);
+      }
+    };
+    r.readAsArrayBuffer(file);
+  });
+  // reset input so same file can be re-uploaded
+  document.getElementById('finp').value='';
+}
+
+function getBrand(fn, sh){
+  const generic=['Sheet1','Sheet2','TDSheet','Лист1','Лист2','Лист3'];
+  if(sh && !generic.includes(sh) && sh.length<35) return sh;
+  const c = fn.replace(/\.[^.]+$/,'').trim();
+  return c.length<35?c:c.substring(0,30);
+}
+
+// ─── PARSE SHEET
+// Формат: A=Артикул  B=Назва  C=Ціна  D=Валюта(USD/EUR/UAH)
+function parseSheet(rows, brand){
+  const res=[];
+  for(let i=0;i<rows.length;i++){
+    const row  = rows[i];
+    const skuR = String(row[0]||'').trim();
+    const name = String(row[1]||'').trim();
+    const price= parseFloat(row[2]);
+    const curr = String(row[3]||'').trim().toUpperCase();
+
+    if(!name || isNaN(price) || price<=0) continue;
+
+    // Артикул — якщо порожній, генеруємо
+    const sku = skuR || (brand.substring(0,3).toUpperCase()+'-'+String(i+1).padStart(3,'0'));
+
+    // Валюта
+    let currency='USD';
+    if(curr==='EUR'||curr==='Є'||curr==='ЄВРО'||curr==='ЕВРО') currency='EUR';
+    else if(curr==='UAH'||curr==='ГРН'||curr==='₴'||curr==='ГРИВНЯ'||curr==='UAH') currency='UAH';
+
+    res.push({sku, name, brand, optPrice:price, currency});
+  }
+  return res;
+}
+
+function showFS(){
+  const el=document.getElementById('fs');
+  if(!products.length){el.innerHTML='';return;}
+  el.innerHTML=`<div class="fl">✅ ${products.length} товарів · ${fnames.map(f=>`<span class="ftag">📄 ${f}</span>`).join(' ')}<button class="btn-clr" onclick="clearCatalog()">Очистити</button></div>`;
+}
+
+function clearCatalog(){
+  if(!confirm('Очистити весь каталог товарів?')) return;
+  products=[];fnames=[];
+  showFS();renderCat();showBanner();
+  showToast('🗑 Каталог очищено');
+}
+
+// ─── AUTOCOMPLETE
+function searchP(q){
+  const l=document.getElementById('acl');
+  if(!q||q.length<1){l.style.display='none';sel=null;chkBtn();return;}
+  const lq=q.toLowerCase();
+  acArr=products.filter(p=>
+    p.name.toLowerCase().includes(lq)||(p.sku&&p.sku.toLowerCase().includes(lq))
+  ).slice(0,16);
+  if(!acArr.length){l.style.display='none';return;}
+  acI=-1;renderAC();l.style.display='block';
+}
+
+function renderAC(){
+  const l=document.getElementById('acl');
+  l.innerHTML=acArr.map((p,i)=>{
+    const stk=stock[p.sku];
+    const cc=p.currency==='USD'?'ct-u':p.currency==='EUR'?'ct-e':'ct-h';
+    const uah=p.currency!=='UAH'?` ≈${fmt(toUAH(p.optPrice,p.currency))} ₴`:'';
+    const stkTxt=stk!==undefined?` · 📦 ${stk} шт`:'';
+    return `<div class="aci${i===acI?' sel':''}" onclick="selP(${i})">
+      <div class="an">${p.name}</div>
+      <div class="as">${p.brand} · ${p.sku} · ${p.optPrice} <span class="ct ${cc}">${p.currency}</span>${uah}${stkTxt}</div>
+    </div>`;
+  }).join('');
+}
+
+function onKey(e){
+  const l=document.getElementById('acl');
+  if(l.style.display==='none') return;
+  if(e.key==='ArrowDown'){acI=Math.min(acI+1,acArr.length-1);renderAC();}
+  else if(e.key==='ArrowUp'){acI=Math.max(acI-1,0);renderAC();}
+  else if(e.key==='Enter'&&acI>=0) selP(acI);
+  else if(e.key==='Escape') l.style.display='none';
+}
+
+function selP(i){
+  sel=acArr[i];
+  document.getElementById('pi').value=sel.name;
+  document.getElementById('acl').style.display='none';
+  updateMP();chkBtn();
+}
+document.addEventListener('click',e=>{
+  if(!e.target.closest('.acw')) document.getElementById('acl').style.display='none';
+});
+
+// ─── MARGIN PREVIEW
+function updateMP(){
+  const el=document.getElementById('mp');
+  if(!sel){el.style.display='none';return;}
+  const sp=parseFloat(document.getElementById('sp').value)||0;
+  const qty=parseInt(document.getElementById('sq').value)||1;
+  const costUAH=toUAH(sel.optPrice,sel.currency)*qty;
+  const saleUAH=sp*qty;
+  const mar=saleUAH-costUAH;
+  const pct=costUAH>0?(mar/costUAH*100).toFixed(1):0;
+  const cc=sel.currency==='USD'?'ct-u':sel.currency==='EUR'?'ct-e':'ct-h';
+  const costLabel=sel.currency!=='UAH'
+    ?`${sel.optPrice*qty} <span class="ct ${cc}">${sel.currency}</span> = ${fmt(costUAH)} ₴`
+    :`${fmt(costUAH)} ₴`;
+  document.getElementById('mpc').innerHTML=costLabel;
+  document.getElementById('mps').textContent=fmt(saleUAH)+' ₴';
+  document.getElementById('mpm').textContent=(mar>=0?'+':'')+fmt(mar)+' ₴';
+  document.getElementById('mpm').style.color=mar>=0?'var(--gr)':'var(--rd)';
+  document.getElementById('mpp').textContent=pct+'%';
+  document.getElementById('mpp').style.color=pct>=15?'var(--gr)':pct>=0?'var(--gd)':'var(--rd)';
+  const stk=stock[sel.sku];
+  const msk=document.getElementById('mpsk');
+  if(stk!==undefined){
+    const after=stk-qty;
+    document.getElementById('mpskv').textContent=after+' шт';
+    document.getElementById('mpskv').style.color=after<=0?'var(--rd)':after<=3?'var(--gd)':'var(--gr)';
+    msk.style.display='block';
+  }else msk.style.display='none';
+  el.style.display='flex';
+}
+
+// ─── DELIVERY
+function updDel(){
+  const cnt=parseInt(document.getElementById('dc').value)||0;
+  const val=parseFloat(document.getElementById('dv').value)||80;
+  const paid=parseFloat(document.getElementById('dp').value)||0;
+  const total=cnt*val;
+  let info='';
+  if(cnt===0) info='Доставки немає';
+  else if(paid<=0) info=`Клієнт оплачує: ${total} ₴ (${cnt} × ${val} ₴)`;
+  else if(paid>=total) info=`Ви оплачуєте повністю: ${total} ₴`;
+  else info=`Ви: ${paid} ₴ · Клієнт: ${(total-paid).toFixed(0)} ₴ · Разом: ${total} ₴`;
+  document.getElementById('di').textContent=info;
+}
+
+// ─── ADD SALE
+function chkBtn(){document.getElementById('add-btn').disabled=!(sel&&parseFloat(document.getElementById('sp').value)>0);}
+document.getElementById('sp').addEventListener('input',chkBtn);
+
+function addSale(){
+  if(!sel) return;
+  const sp=parseFloat(document.getElementById('sp').value);
+  const qty=parseInt(document.getElementById('sq').value)||1;
+  const dc=parseInt(document.getElementById('dc').value)||0;
+  const dv=parseFloat(document.getElementById('dv').value)||0;
+  const dp=parseFloat(document.getElementById('dp').value)||0;
+  const costUAH=toUAH(sel.optPrice,sel.currency)*qty;
+  const saleUAH=sp*qty;
+  sales.push({
+    id:Date.now(),date:new Date().toISOString(),
+    productName:sel.name,brand:sel.brand,sku:sel.sku,qty,
+    optPrice:sel.optPrice,optCurr:sel.currency,
+    rateUsed:getRate(sel.currency),
+    saleUAH,costUAH,marUAH:saleUAH-costUAH,
+    myDel:Math.min(dp,dc*dv),delCount:dc,delCost:dv,
+    buyer:document.getElementById('sbu').value,
+    note:document.getElementById('sno').value
+  });
+  if(stock[sel.sku]!==undefined) stock[sel.sku]=Math.max(0,stock[sel.sku]-qty);
+  updStats();resetF();showBanner();
+  showToast('✅ Продаж додано! Натисни 💾 Зберегти.');
+}
+
+function deleteSale(id){
+  const s=sales.find(x=>x.id===id);
+  if(s&&s.sku&&stock[s.sku]!==undefined) stock[s.sku]+=s.qty;
+  sales=sales.filter(x=>x.id!==id);
+  updStats();renderRep();showBanner();
+  showToast('🗑 Видалено');
+}
+
+function resetF(){
+  ['pi','sp','sbu','sno'].forEach(id=>document.getElementById(id).value='');
+  document.getElementById('sq').value='1';
+  document.getElementById('dc').value='0';
+  document.getElementById('dp').value='0';
+  document.getElementById('di').textContent='Клієнт оплачує доставку';
+  document.getElementById('mp').style.display='none';
+  document.getElementById('add-btn').disabled=true;
+  sel=null;
+}
+
+// ─── STATS
+function updStats(){
+  const today=new Date().toDateString();
+  const ts=sales.filter(s=>new Date(s.date).toDateString()===today);
+  const rev=ts.reduce((a,s)=>a+s.saleUAH,0);
+  const mar=ts.reduce((a,s)=>a+s.marUAH,0);
+  const cost=ts.reduce((a,s)=>a+s.costUAH,0);
+  const del=ts.reduce((a,s)=>a+(s.myDel||0),0);
+  document.getElementById('st-c').textContent=ts.length;
+  document.getElementById('st-r').textContent=fmt(rev)+' ₴';
+  document.getElementById('st-m').textContent=fmt(mar)+' ₴';
+  document.getElementById('st-p').textContent=(cost>0?(mar/cost*100).toFixed(1):0)+'%';
+  document.getElementById('st-d').textContent=fmt(del)+' ₴';
+}
+
+// ─── CATALOG
+function renderCat(q=''){
+  const g=document.getElementById('catg');
+  if(!products.length){
+    g.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="ei">📂</div><p>Завантажте прайс-листи</p></div>';
+    return;
+  }
+  const lq=q.toLowerCase();
+  const list=q?products.filter(p=>
+    p.name.toLowerCase().includes(lq)||(p.sku&&p.sku.toLowerCase().includes(lq))||(p.brand&&p.brand.toLowerCase().includes(lq))
+  ):products;
+  if(!list.length){
+    g.innerHTML='<div class="empty" style="grid-column:1/-1"><div class="ei">🔍</div><p>Нічого не знайдено</p></div>';
+    return;
+  }
+  g.innerHTML=list.slice(0,200).map(p=>{
+    const stk=stock[p.sku];
+    const cc=p.currency==='USD'?'ct-u':p.currency==='EUR'?'ct-e':'ct-h';
+    const sb=stk!==undefined
+      ?`<span class="badge ${stk===0?'b-r':stk<=3?'b-d':'b-g'}">${stk===0?'Немає':stk+' шт'}</span>`
+      :`<span class="badge b-b">—</span>`;
+    const uahStr=p.currency!=='UAH'
+      ?`<div><div class="ccpl">≈ UAH</div><div class="ccpv" style="color:var(--gd)">${fmt(toUAH(p.optPrice,p.currency))} ₴</div></div>`:'';
+    return `<div class="cc">
+      <div class="ccb">${p.brand}</div>
+      <div class="ccn">${p.name} <span style="font-size:10px;color:var(--mu)">${p.sku}</span></div>
+      <div class="ccp">
+        <div><div class="ccpl">Закупка</div><div class="ccpv" style="color:var(--ac)">${p.optPrice} <span class="ct ${cc}">${p.currency}</span></div></div>
+        ${uahStr}
+      </div>
+      <div class="stk-row">${sb}<span style="font-size:11px;color:var(--mu)">Залишок:</span>
+        <input type="number" min="0" value="${stk!==undefined?stk:''}" placeholder="—"
+               onchange="setStk('${p.sku.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}',this.value)">
+      </div>
+    </div>`;
+  }).join('');
+  if(list.length>200) g.innerHTML+=`<div style="grid-column:1/-1;text-align:center;color:var(--mu);padding:14px;font-size:13px">Показано 200 з ${list.length}. Уточніть пошук.</div>`;
+}
+
+function setStk(sku,val){
+  const n=parseInt(val);
+  if(!isNaN(n)&&n>=0){stock[sku]=n;showBanner();showToast('📦 Збережено');}
+}
+
+// ─── REPORTS
+function initDates(){
+  const t=new Date().toISOString().split('T')[0];
+  if(!document.getElementById('rt').value) document.getElementById('rt').value=t;
+  if(!document.getElementById('rf').value){const d=new Date();d.setDate(1);document.getElementById('rf').value=d.toISOString().split('T')[0];}
+}
+function setToday(){const t=new Date().toISOString().split('T')[0];document.getElementById('rf').value=t;document.getElementById('rt').value=t;renderRep();}
+function setMonth(){const n=new Date();document.getElementById('rf').value=new Date(n.getFullYear(),n.getMonth(),1).toISOString().split('T')[0];document.getElementById('rt').value=n.toISOString().split('T')[0];renderRep();}
+function setAll(){document.getElementById('rf').value='';document.getElementById('rt').value='';renderRep();}
+
+function renderRep(){
+  const from=document.getElementById('rf').value;
+  const to=document.getElementById('rt').value;
+  const fs=sales.filter(s=>{const d=s.date.split('T')[0];return(!from||d>=from)&&(!to||d<=to);});
+  const totR=fs.reduce((a,s)=>a+s.saleUAH,0);
+  const totM=fs.reduce((a,s)=>a+s.marUAH,0);
+  const totC=fs.reduce((a,s)=>a+s.costUAH,0);
+  const totD=fs.reduce((a,s)=>a+(s.myDel||0),0);
+  const totQ=fs.reduce((a,s)=>a+s.qty,0);
+  document.getElementById('r-sum').innerHTML=`
+    <div class="rr"><span class="rn">Продажів</span><span class="rv cb">${fs.length}</span></div>
+    <div class="rr"><span class="rn">Одиниць</span><span class="rv cb">${totQ}</span></div>
+    <div class="rr"><span class="rn">Виручка</span><span class="rv cd">${fmt(totR)} ₴</span></div>
+    <div class="rr"><span class="rn">Маржа</span><span class="rv cg">${fmt(totM)} ₴</span></div>
+    <div class="rr"><span class="rn">Маржа %</span><span class="rv cg">${totC>0?(totM/totC*100).toFixed(1):0}%</span></div>
+    <div class="rr"><span class="rn">Витрати доставка</span><span class="rv cr">−${fmt(totD)} ₴</span></div>
+    <div class="rr"><span class="rn" style="font-weight:700">Чиста маржа</span><span class="rv" style="color:var(--gd);font-weight:700">${fmt(totM-totD)} ₴</span></div>`;
+  const bp={};
+  fs.forEach(s=>{if(!bp[s.productName])bp[s.productName]={qty:0,mar:0};bp[s.productName].qty+=s.qty;bp[s.productName].mar+=s.marUAH;});
+  const top=Object.entries(bp).sort((a,b)=>b[1].qty-a[1].qty).slice(0,10);
+  document.getElementById('r-top').innerHTML=top.length
+    ?top.map(([n,d])=>`<div class="rr"><span class="rn" title="${n}">${n.length>32?n.substring(0,32)+'…':n}</span><span class="rv"><span class="badge b-b">${d.qty} шт</span> <span class="badge b-g">${fmt(d.mar)} ₴</span></span></div>`).join('')
+    :'<div style="color:var(--mu);font-size:13px;padding:12px">Немає даних</div>';
+  const low=Object.entries(stock).filter(([k,v])=>v<=3).map(([k,v])=>{const p=products.find(x=>x.sku===k);return p?{name:p.name,qty:v}:null;}).filter(Boolean).sort((a,b)=>a.qty-b.qty);
+  document.getElementById('r-low').innerHTML=low.length
+    ?low.map(x=>`<div class="rr"><span class="rn">${x.name}</span><span class="rv"><span class="badge ${x.qty===0?'b-r':'b-d'}">${x.qty===0?'Немає':x.qty+' шт'}</span></span></div>`).join('')
+    :'<div style="color:var(--mu);font-size:13px;padding:10px">Все в порядку 👍</div>';
+  const tb=document.getElementById('r-tb');
+  if(!fs.length){tb.innerHTML='<tr><td colspan="11" style="text-align:center;color:var(--mu);padding:36px">Немає продажів за цей період</td></tr>';return;}
+  tb.innerHTML=[...fs].reverse().map(s=>{
+    const d=new Date(s.date);
+    const ds=`${d.getDate().toString().padStart(2,'0')}.${(d.getMonth()+1).toString().padStart(2,'0')} ${d.getHours().toString().padStart(2,'0')}:${d.getMinutes().toString().padStart(2,'0')}`;
+    const pct=s.costUAH>0?(s.marUAH/s.costUAH*100).toFixed(0):0;
+    const curr=s.optCurr||'USD';
+    const cc=curr==='USD'?'ct-u':curr==='EUR'?'ct-e':'ct-h';
+    const rate=s.rateUsed&&curr!=='UAH'?` @${s.rateUsed}`:'';
+    return `<tr>
+      <td style="color:var(--mu);white-space:nowrap;font-size:12px">${ds}</td>
+      <td title="${s.productName}">${s.productName.length>24?s.productName.substring(0,24)+'…':s.productName}</td>
+      <td style="font-size:11px;color:var(--mu)">${s.sku||'—'}</td>
+      <td style="text-align:center">${s.qty}</td>
+      <td style="font-size:12px">${s.optPrice} <span class="ct ${cc}">${curr}</span><br><span style="font-size:10px;color:var(--mu)">${fmt(s.costUAH)} ₴${rate}</span></td>
+      <td style="color:var(--gd);font-weight:600">${fmt(s.saleUAH)} ₴</td>
+      <td style="color:${s.marUAH>=0?'var(--gr)':'var(--rd)'};font-weight:600">${s.marUAH>=0?'+':''}${fmt(s.marUAH)}</td>
+      <td><span class="badge ${pct>=20?'b-g':'b-b'}">${pct}%</span></td>
+      <td style="color:var(--rd);font-size:12px">${s.myDel>0?'−'+fmt(s.myDel):'—'}</td>
+      <td style="color:var(--mu);font-size:12px">${s.note||s.buyer||'—'}</td>
+      <td><button class="btn-x" onclick="deleteSale(${s.id})">✕</button></td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── HELPERS
+function fmt(n){return Math.round(n).toLocaleString('uk-UA');}
+function showToast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'),3500);
+}
+</script>
+
+
+</body></html>
